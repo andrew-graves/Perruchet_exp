@@ -1,0 +1,560 @@
+---
+title: "Perruchet Experiment 2 Report"
+author: "Andrew Graves"
+date: "May 20, 2019"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, error = FALSE, 
+  cache = FALSE, fig.width = 6, fig.height = 5, tidy = TRUE)
+options(scipen = 1, digits = 3, width = 60)
+```
+
+# Load Packages
+
+```{r pckgs, message = FALSE}
+library(tidyverse)
+library(readxl)
+library(lmerTest)
+library(optimx)
+library(ordinal)
+library(effects)
+```
+
+# Initialize vectors
+
+```{r vectors}
+
+phasic_matched_header <- 4
+phasic_unmatched_header <- 6
+phasic_footer <- -1
+tonic_header <- 3
+tonic_footer <- -5
+file_vector <- c("base", "stim")
+stim_vector <- c("8", "1", "2", "4")
+bad_tonic_vector <- c(7, 17, 57, 75)
+extra_rows <- c(70, 98, 116, 118)
+
+# Specify participants
+
+participant_id <- 1:123
+
+# Orthogonalize contrasts
+
+options(contrasts = c("contr.sum","contr.poly"))
+
+# Set optimizer for model
+
+optimize <- lmerControl(optimizer ='optimx', optCtrl=list(method='nlminb'))
+
+# Set ggplot theme
+
+theme_set(theme_classic())
+theme_update(text = element_text(family="serif", size=20), 
+plot.title = element_text(hjust = 0.5), 
+axis.title.y = element_text(margin = margin(t = 0, r = 20, b = 0, l = 0)))#,
+#strip.background = element_rect(fill = "black"))
+```
+
+# Read and tidy phasic data
+
+```{r read_phasic}
+
+read_and_tidy_phasic <- function(i) {
+  
+  file_phasic <- paste0("P", as.character(i), "-EDA-10.xls")
+  
+  if (file.exists(file_phasic)) {
+    
+    full <- read_excel(file_phasic, skip = phasic_matched_header) %>%
+      add_column(subj = i)
+    unmatched_start <- which(full == "Time") + phasic_unmatched_header
+    unmatched_end <- which(full == "SCR Frequency Analysis") + 
+      phasic_matched_header + phasic_footer
+    
+    matched <- full %>%
+      drop_na() %>%
+      rename(Time = `Stim Time`) %>%
+      map_dfr(as.numeric)
+    
+    unmatched <- read_excel(
+      file_phasic, range = cell_rows(unmatched_start:unmatched_end)
+      ) %>%
+      select(Time, `Stim Label`) %>%
+      drop_na() %>%
+      map_dfr(as.numeric)
+    
+    sequence_vector <- select(matched, Time, `Stim Label`) %>%
+      bind_rows(unmatched) %>%
+      add_column(subj = i) %>%
+      arrange(`Stim Label`, Time)
+    
+    min_time <- sequence_vector %>%
+      filter(`Stim Label` == 1) %>%
+      summarize(min_time = min(Time)) %>%
+      as_vector()
+    
+    matched %>%
+      full_join(sequence_vector, by = c("Time", "Stim Label", "subj")) %>%
+      filter(Time > min_time) %>%
+      replace_na(`SCR Amplitude` = 0) %>%
+      arrange(Time) %>%
+      rename(time = Time, scl = SCL, latency = Latency, 
+             phasic_dv = `SCR Amplitude`, rise_time = `SCR Rise Time`, 
+             size = `SCR Size`, onset = `SCR Onset`, stim_type = `Stim Label`)
+    
+  } 
+}
+
+# Apply read_and_tidy_phasic to the data and return a data frame
+
+# phasic_data_list <- lapply(participant_id, read_and_tidy_phasic)
+# phasic_data <- do.call(rbind, phasic_data_list)
+# save(phasic_data, file = "phasic_data")
+
+load("phasic_data")
+```
+
+# Read and tidy tonic data
+
+```{r read_tidy}
+
+read_and_tidy_tonic <- function(i) {
+  
+  file_base <- paste0("P", as.character(i), "-SR-Baseline.xls")
+  file_stim <- paste0("P", as.character(i), "-SR-Stimulus.xls")
+  file_subj <- c(file_base, file_stim)
+  
+  for (j in seq_along(file_vector)){
+    
+    file_name <- file_subj[j]
+    
+    if (file.exists(file_name)) {
+      
+      tonic_list_base <- list()
+      tonic_list_stim <- list()
+      m <- 0
+      n <- 0
+      
+      for (k in seq_along(stim_vector)){
+        
+        full <- read_excel(file_name) %>% 
+          add_column(subj = i)
+        
+        stim_type <- stim_vector[k]
+        
+        start <- which(full == paste("Stimulus", stim_type)) + 
+          tonic_header
+        
+        if (k < length(stim_vector)) {
+          
+          end_pad <- which(full == paste("Stimulus", stim_vector[k + 1])) + 
+            tonic_header
+          end <- end_pad + tonic_footer
+          
+        } else if (i %in% extra_rows){
+        # These participants have Stimulus 5 category... which should not exist
+          end_pad <- which(full == paste("Stimulus 5")) + tonic_header
+          end <- end_pad + tonic_footer          
+          
+        } else {
+          
+          end <- nrow(full) + 1
+          
+        }
+        
+        if (i %in% bad_tonic_vector){
+          break # Need tonic files for participant 17
+                # Participant 57 and 75 have no data
+                # Participant 7 does not have matching stimulus/ baseline
+        }
+        
+        if (j == 1) {
+          
+          m <- m + 1
+          
+          tonic_list_base[[m]] <- read_excel(file_name, 
+                                             range = cell_rows(start:end)) %>%
+            drop_na() %>%
+            add_column(stim_type = stim_vector[k], subj = i) %>%
+            rename(time = `Onset Time`, 
+                   min_base = `Min(CH 3)`, 
+                   mean_base = `Mean(CH 3)`, 
+                   max_base = `Max(CH 3)`)
+          
+          flattened_base <- do.call(rbind, tonic_list_base)
+          
+        } else {
+          
+          n <- n + 1
+          
+          tonic_list_stim[[n]] <- read_excel(file_name, 
+                                             range = cell_rows(start:end)) %>%
+            drop_na() %>%
+            select(-`Onset Time`) %>% 
+            rename(min_stim = `Min(CH 3)`,
+                   mean_stim = `Mean(CH 3)`, 
+                   max_stim = `Max(CH 3)`)
+          
+          flattened_stim <- do.call(rbind, tonic_list_stim)
+          
+        }
+      }
+      
+    if (j == length(file_vector) & k == length(stim_vector)){
+
+    flattened_data <- do.call(cbind, list(flattened_base, flattened_stim))
+
+    min_time <- select(flattened_data, time, stim_type) %>%
+      filter(stim_type == 1) %>%
+      summarize(min_time = min(time)) %>%
+      as_vector()
+
+    return_this <- flattened_data %>%
+      filter(time > min_time)
+    
+    return(return_this)
+      }
+    }
+  }
+}
+
+# tonic_data_list <- lapply(participant_id, read_and_tidy_tonic)
+# tonic_data <- do.call(rbind, tonic_data_list)
+# save(tonic_data, file = "tonic_data")
+
+load("tonic_data")
+```
+
+# Read and tidy run sequence data
+
+```{r read_run, message = FALSE}
+
+# Select relevant columns
+
+col_vector <- c("Subject", "Block", "Procedure", "Expectancy.RESP", 
+                "Expectancy.RT", "Image1", "Image2", "Image3", "Blue.ACC")
+
+full_eprime_data <- read_delim("exp_2_eprime.txt", "\t") %>%
+  select(col_vector) %>%
+  filter(!is.na(Subject))
+
+eprime_data <- full_eprime_data %>%
+  group_by(Subject) %>%
+  tally() %>%
+  filter(n == 28 & Subject <= max(participant_id)) %>%
+  select(Subject) %>%
+  inner_join(full_eprime_data, by = "Subject") %>%
+  rename(subj = Subject, block = Block, proc = Procedure, 
+         exp_resp = Expectancy.RESP, exp_rt_ms = Expectancy.RT, 
+         man_check = Blue.ACC) %>%
+  mutate(log_rt = log(exp_rt_ms/1000))
+```
+
+# Join data sources for participants with complete run sequences
+
+```{r join}
+
+good_subj_tonic <- tonic_data %>%
+  filter(stim_type == 1) %>%
+  group_by(subj) %>%
+  tally() %>%
+  filter(n == 28) %>%
+  select(subj)
+
+match_subj <- phasic_data %>%
+  filter(stim_type == 1) %>%
+  semi_join(eprime_data, by = "subj") %>%
+  semi_join(tonic_data, by = "subj")
+
+select_subj <- match_subj %>%
+  group_by(subj) %>%
+  tally() %>%
+  filter(n == 28) %>%
+  select(subj)
+
+phasic_join <- select_subj %>%
+  inner_join(match_subj, by = "subj")
+
+eprime_join <- select_subj %>%
+  inner_join(eprime_data, by = "subj")
+
+tonic_join <- select_subj %>%
+  inner_join(tonic_data, by = "subj") %>%
+  filter(stim_type == 1)
+
+model_data <- phasic_join %>%
+  bind_cols(tonic_join) %>%
+  bind_cols(eprime_join)
+
+```
+
+# Generate data set to analyze all stimuli presentations,
+# not just the run initiator
+
+```{r full_data}
+phasic_full <- phasic_data %>%
+  inner_join(select_subj, by = "subj") %>%
+  filter(stim_type != 2)
+
+tonic_full <- tonic_data %>%
+  inner_join(select_subj, by = "subj") %>%
+  filter(stim_type != 2) %>%
+  arrange(subj, time) %>%
+  as.tbl()
+
+eprime_full <- eprime_join %>%
+  mutate(seq_id = seq(1, nrow(eprime_join))) %>%
+  gather(stim_id, image, c(Image1, Image2, Image3)) %>%
+  arrange(subj, seq_id) %>%
+  mutate(rm_rows = paste0(proc, stim_id)) %>%
+  filter(rm_rows != "CSNeg1Image2", rm_rows != "CSNeg1Image3",
+    rm_rows != "CSPos1Image2", rm_rows != "CSPos1Image3",
+    rm_rows != "CSNeg2Image3", rm_rows != "CSPos2Image3") %>%
+  select(-rm_rows)
+
+model_full_data <- phasic_full %>%
+  bind_cols(tonic_full) %>%
+  bind_cols(eprime_full) %>%
+  mutate(match_proc = paste0(proc, stim_type))
+
+model_full_data$match_proc <- car::recode(model_full_data$match_proc, 
+  "c('CSPos24','CSPos34') = 'CSPos1'; c('CSNeg24','CSNeg34') = 'CSNeg1'; 
+  'CSPos38' = 'CSPos2'; 'CSNeg38' = 'CSNeg2';
+  'CSPos11' = 'CSPos1'; 'CSNeg11' = 'CSNeg1';
+  'CSPos21' = 'CSPos2'; 'CSNeg21' = 'CSNeg2';
+  'CSPos31' = 'CSPos3'; 'CSNeg31' = 'CSNeg3'")
+
+model_full_data$proc <- factor(model_full_data$match_proc,
+  levels = c("CSNeg3", "CSNeg2", "CSNeg1", "CSPos1", "CSPos2", "CSPos3"), 
+  ordered = TRUE)
+model_full_data$subj <- factor(model_full_data$subj)
+
+model_full_data <- model_full_data %>%
+  replace_na(list(phasic_dv = 0)) %>%
+  mutate(mean_mean = mean_stim - mean_base,
+         log_phasic = log(phasic_dv + 1))
+
+# Factor expectancy data
+
+model_data$proc <- factor(model_data$proc,
+  levels = c("CSNeg3", "CSNeg2", "CSNeg1", "CSPos1", "CSPos2", "CSPos3"), 
+  ordered = TRUE)
+model_data$exp_resp <- factor(model_data$exp_resp, ordered = TRUE)
+model_data$subj <- factor(model_data$subj)
+```
+
+## Explore the distribution of variables
+
+```{r plot_dv}
+hist_vec <- c("phasic_dv", "log_phasic", "mean_mean", "log_rt")
+xlab_vec <- c("Phasic SCR", "log(Phasic SCR)", 
+              "Tonic EDA: Mean during - Mean base", 
+              "log(Expectancy RT)")
+
+plot_hist <- function(i, j) {
+  
+  if (i != "log_rt") {
+    
+  data <- model_full_data
+    
+  } else {
+    
+  data <- model_data
+  
+  }
+  
+  data %>%
+  ggplot(aes(x = eval(parse(text = i)))) +
+  geom_histogram(binwidth = .05) + 
+  labs(x = j, y = "Count")
+}
+
+hists <- map2(hist_vec, xlab_vec, plot_hist)
+
+```
+
+```{r plot_dv1}
+hists[[1]]
+```
+
+We have the same problem as before. The phasic data is extremely sparse. Approximately 70% of the trials are 0's. I don't see the benefit of trying to model phasic data over tonic data. We can chat about that at some point, if you'd like. I think there were some pre-processing errors in the phasic data as well. I should come down and write a reproducible script for pipelining the raw data. 
+
+```{r plot_dv2}
+hists[[2]]
+```
+
+Taking the log of the phasic response doesn't really help us either. 
+
+```{r plot_dv3}
+hists[[3]]
+```
+
+The tonic data looks OK, although it is also very dense around 0. I like the tonic data because it allows trials to have negative values, rather than bounding the measurement at 0. That additional variance is probably meaningful. 
+
+```{r plot_dv4}
+hists[[4]]
+```
+
+This RT data is actually pretty interesting. I never looked at RT from experiment 1, so I put it in here as an exploratory analysis. 
+
+```{r plot_dv5}
+model_data %>%
+  ggplot(aes(x = exp_resp)) +
+  geom_bar() + 
+  labs(x = "Expectancy Response", y = "Count")
+```
+
+This data is ordinal, so a cumulative mixed link model should do the trick.
+
+## Mixed effects models on tonic DV, phasic DV, expectancy response, and expectancy RT
+```{r run_lmer_clmm}
+dv_vec <- c("log_phasic", "mean_mean", "log_rt", "exp_resp")
+ylab_vec <- c("log(Phasic SCR)", "Tonic EDA: Mean during - Mean base", 
+  "log(Expectancy RT)", "Expectancy Response")
+
+run_lmer <- function(i, j) {
+  
+  if (i == "log_phasic" | i == "mean_mean") {
+    
+    alt_model <- lmerTest::lmer(as.formula(paste(i, "~ proc  + 
+              (0 + proc|subj)")), data = model_full_data, REML = FALSE, 
+              control = optimize)
+    null_model <- lmerTest::lmer(as.formula(paste(i, "~ 1  + 
+              (0 + proc|subj)")), data = model_full_data, REML = FALSE, 
+              control = optimize)
+    
+  } else {
+    
+    alt_model <- lmerTest::lmer(as.formula(paste(i, "~ proc  + 
+              (0 + proc|subj)")), data = model_data, REML = FALSE, 
+              control = optimize)
+    null_model <- lmerTest::lmer(as.formula(paste(i, "~ 1  + 
+              (0 + proc|subj)")), data = model_data, REML = FALSE, 
+              control = optimize)
+    
+  }
+
+effect_data <- data.frame(effect("proc", alt_model))
+effect_data$proc <- factor(effect_data$proc, levels = 
+                            c("CSNeg3", "CSNeg2", "CSNeg1", 
+                              "CSPos1", "CSPos2", "CSPos3"))
+                            
+plots <- effect_data %>%
+  ggplot(aes(x = proc, y = fit, group = 1)) + 
+  geom_point() + 
+  geom_line() +
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = .1) + 
+  labs(x = "", y = j)
+
+return(list(alt_model, null_model, plots))
+
+}
+
+# models <- map2(dv_vec, ylab_vec, run_lmer)
+# save(models, file = "perruchet_exp2_lmer_models")
+load("perruchet_exp2_lmer_models")
+
+# cum_mod <- clmm(exp_resp ~ proc + (0 + proc|subj), data = model_data)
+# save(cum_mod, file = "perruchet_exp2_clmm_model")
+load("perruchet_exp2_clmm_model")
+```
+
+## Here are the models:
+
+The contrasts for proc.L are the linear contrasts for run sequence on DV.
+
+```{r plot_lmer1}
+summary(models[[1]][[1]])$coefficients #Phasic SCR
+models[[1]][[3]]
+```
+
+```{r plot_lmer2}
+summary(models[[2]][[1]])$coefficients #Tonic EDA
+models[[2]][[3]]
+```
+
+```{r plot_lmer3}
+summary(models[[3]][[1]])$coefficients #Expectancy RT
+models[[3]][[3]]
+```
+
+```{r plot_lmer4}
+summary(cum_mod)$coefficients #Expectancy response
+models[[4]][[3]] # For plotting purposes only!
+```
+
+This model of expectancy response is for plotting purposes only. From my understanding, there is no easy way in R to plot ordinal mixed effects models, so I am plotting a gaussian model here. 
+
+## Exploratory plots
+
+Is the relationship between tonic and phasic measurments linear? Probably not... let's first consider the plot including rows that contain 0s from the phasic analysis. There are lots of them. In the following two plots, darker colors mean greater density in that region of the graph:
+```{r scatter1}  
+model_full_data %>%
+  ggplot(aes(x = mean_mean, y = log_phasic)) + 
+  geom_point(alpha = .25) + 
+  geom_smooth(method = "lm", se = TRUE, color = "black") + 
+  labs(x = "Tonic EDA", y = "Phasic SCR")
+```
+
+Now let's consider the data excluding rows that contain 0s from the phasic analysis. It still does not seem like they follow similar distributions:
+```{r scatter2}
+model_full_data %>%
+  filter(log_phasic > 0) %>%
+  ggplot(aes(x = mean_mean, y = log_phasic)) + 
+  geom_point(alpha = .25) + 
+  geom_smooth(method = "lm", se = TRUE, color = "black") + 
+  labs(x = "Tonic EDA", y = "Phasic SCR")
+```
+
+If we code the data as binomial (was there a phasic response or not?),  we can see that not many trials are generating phasic SCRs. The plot below shows the proportion of non-0 phasic responses on the x-axis with the number of subjects with that proportion on the y-axis. Each sub plot includes data from one condition, meaning a 50% proportion represents a different absolute number of trials across sub plots:
+
+```{r reset_width, include = FALSE}
+knitr::opts_chunk$set(fig.width = 12, fig.height = 8)
+```
+
+```{r binom_plot}
+model_full_data %>%
+  mutate(binom = phasic_dv > 0) %>%
+  group_by(proc, subj) %>%
+  summarize(mean_binom = mean(binom == 1)) %>%
+  ggplot(aes(x = mean_binom)) + 
+  geom_histogram() +
+  facet_wrap(~proc) +
+  labs(x = "Proportion of Non-0 Phasic SCR", y = "Number of Subjects") +
+  theme(legend.position = "none")
+```
+
+## Query habituation effects on CS and US
+
+```{r habit}
+cs_data <- model_full_data %>%
+  group_by(subj) %>%
+  mutate(Trial = 1:44) %>%
+  group_by(Trial) %>%
+  summarize(`Raw CS` = mean(mean_stim),
+    `Baseline corrected CS`= mean(mean_stim - mean_base)) %>%
+  gather(key = key, value = dv, -Trial)
+
+tonic_data %>%
+  mutate(subj = factor(subj)) %>%
+  semi_join(model_full_data, by = "subj") %>%
+  filter(stim_type == 2) %>%
+  group_by(subj) %>%
+  mutate(Trial = 1:22) %>%
+  group_by(Trial) %>%
+  summarize(`Raw US` = mean(mean_stim),
+    `Baseline corrected US` = mean(mean_stim - mean_base))  %>%
+  gather(key = key, value = dv, -Trial) %>%
+  bind_rows(cs_data) %>%
+  ggplot(aes(x = Trial, y = dv)) + 
+  geom_point() + 
+  geom_line() + 
+  labs(y = "EDA") +
+  facet_wrap(~key, scales = "free")
+
+```
+
